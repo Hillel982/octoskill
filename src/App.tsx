@@ -21,6 +21,7 @@ import {
   Cpu, 
   HelpCircle, 
   ChevronRight, 
+  ChevronDown,
   HelpCircle as QuizIcon, 
   FileText, 
   Check, 
@@ -113,10 +114,12 @@ export default function App() {
   
   const [inputUrl, setInputUrl] = useState<string>("");
   const [inputGoal, setInputGoal] = useState<string>("");
+  const [guideDepth, setGuideDepth] = useState<string>("Auto");
+  const [isCustomizeOpen, setIsCustomizeOpen] = useState<boolean>(false);
   const [skillLevel, setSkillLevel] = useState<string>("Intermediate");
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'walkthrough' | 'concepts' | 'checklist' | 'quiz' | 'flashcards'>('walkthrough');
+  const [activeTab, setActiveTab] = useState<'walkthrough' | 'concepts' | 'checklist' | 'quiz' | 'flashcards' | 'transcript'>('walkthrough');
   
   // Progress & Interaction state loaded from localStorage for auto-save/auto-load
   const [completedSteps, setCompletedSteps] = useState<Record<number, boolean>>(() => {
@@ -154,8 +157,117 @@ export default function App() {
   const [copied, setCopied] = useState<boolean>(false);
   const [exportType, setExportType] = useState<'full' | 'walkthrough' | 'concepts' | 'checklist' | 'quiz' | 'flashcards'>('full');
 
+  // Transcript Feature State (added as requested)
+  const [transcript, setTranscript] = useState<{
+    status: string;
+    source_type: string;
+    language: string;
+    segments: Array<{
+      start_time: string;
+      end_time: string;
+      speaker: string;
+      text: string;
+    }>;
+    full_text: string;
+  } | null>(() => {
+    const activeUrl = localStorage.getItem("octoskill_active_youtube_url") || (SAMPLE_GUIDES[0] ? SAMPLE_GUIDES[0].youtubeUrl : "");
+    if (activeUrl) {
+      const cacheKey = `octoskill_transcript_cache_${activeUrl.toLowerCase().trim()}`;
+      const saved = localStorage.getItem(cacheKey);
+      if (saved) {
+        try {
+          return JSON.parse(saved);
+        } catch {}
+      }
+    }
+    return null;
+  });
+  const [transcriptLoading, setTranscriptLoading] = useState<boolean>(false);
+  const [transcriptError, setTranscriptError] = useState<string | null>(null);
+  const [transcriptSearchQuery, setTranscriptSearchQuery] = useState<string>("");
+
+  // Load transcript from cache whenever active youtubeUrl changes
+  useEffect(() => {
+    if (youtubeUrl) {
+      const cacheKey = `octoskill_transcript_cache_${youtubeUrl.toLowerCase().trim()}`;
+      const saved = localStorage.getItem(cacheKey);
+      if (saved) {
+        try {
+          setTranscript(JSON.parse(saved));
+        } catch {
+          setTranscript(null);
+        }
+      } else {
+        setTranscript(null);
+      }
+      setTranscriptError(null);
+      setTranscriptSearchQuery("");
+    } else {
+      setTranscript(null);
+    }
+  }, [youtubeUrl]);
+
+  const handleGenerateTranscript = async (force: boolean = false) => {
+    if (!youtubeUrl) {
+      setTranscriptError("No active video URL loaded.");
+      return;
+    }
+
+    const trimmedUrl = youtubeUrl.trim();
+    const cacheKey = `octoskill_transcript_cache_${trimmedUrl.toLowerCase()}`;
+
+    // If not forced and we have cache, reuse it
+    if (!force) {
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        try {
+          setTranscript(JSON.parse(cached));
+          setTranscriptError(null);
+          return;
+        } catch {}
+      }
+    }
+
+    setTranscriptLoading(true);
+    setTranscriptError(null);
+
+    try {
+      const response = await fetch("/api/generate-transcript", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          youtubeUrl: trimmedUrl,
+          language: "en"
+        })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to generate transcript.");
+      }
+
+      setTranscript(data);
+      localStorage.setItem(cacheKey, JSON.stringify(data));
+      showToast("Transcript generated successfully!");
+    } catch (err: any) {
+      console.error(err);
+      setTranscriptError(err.message || "An unexpected error occurred while transcribing.");
+    } finally {
+      setTranscriptLoading(false);
+    }
+  };
+
   // Gemini Intelligence Integration States
-  const [selectedModel, setSelectedModel] = useState<string>("gemini-3.5-flash");
+  const [selectedModel, setSelectedModel] = useState<string>("fast");
+  const [cacheHitNotice, setCacheHitNotice] = useState<{
+    youtubeUrl: string;
+    learnerGoal: string;
+    skillLevel: string;
+    selectedModel: string;
+  } | null>(null);
   const [askQuestion, setAskQuestion] = useState<string>("");
   const [askAnswer, setAskAnswer] = useState<string>("");
   const [askLoading, setAskLoading] = useState<boolean>(false);
@@ -606,8 +718,15 @@ export default function App() {
   };
 
   // Generate learning guide using Express proxy endpoint
-  const handleGenerate = async (e: FormEvent) => {
+  const handleGenerate = async (e: FormEvent, bypassCache: boolean = false) => {
     e.preventDefault();
+    if (loading) return; // Prevent multiple simultaneous requests (Task 4)
+
+    // TODO: FUTURE SAAS USAGE LIMITS (Frontend guard or warning):
+    // - Free users: 3 guides/month. Warn user if they are close to the limit.
+    // - Builder users: 25 guides/month.
+    // - Pro users: higher limit + Search grounding. Disable Search option if user is on Free/Builder tier.
+
     const trimmedUrl = inputUrl.trim();
     const trimmedGoal = inputGoal.trim();
 
@@ -616,15 +735,45 @@ export default function App() {
       return;
     }
 
-    const isYoutube = trimmedUrl.includes("youtube.com") || trimmedUrl.includes("youtu.be");
+    const isYoutube = trimmedUrl.includes("youtube.com/watch?v=") || trimmedUrl.includes("youtu.be/");
     if (!isYoutube) {
-      setError("Invalid YouTube URL: Please provide a valid YouTube video link (e.g., https://www.youtube.com/watch?v=...)");
+      setError("Invalid YouTube URL: Please provide a valid YouTube link (e.g., youtube.com/watch?v= or youtu.be/).");
       return;
     }
 
-    if (!trimmedGoal) {
-      setError("Empty learning goal: Please enter what you want to learn from this tutorial to help Gemini customize your curriculum!");
-      return;
+    // Basic local usage protection: Cache lookup (Task 6)
+    const cacheKey = "octoskill_generated_cache";
+    const cachedDataStr = localStorage.getItem(cacheKey);
+    let cache: any[] = [];
+    if (cachedDataStr) {
+      try {
+        cache = JSON.parse(cachedDataStr);
+      } catch {}
+    }
+
+    if (!bypassCache) {
+      const match = cache.find(
+        (entry) =>
+          entry.youtubeUrl.toLowerCase() === trimmedUrl.toLowerCase() &&
+          (entry.learnerGoal || "").toLowerCase() === trimmedGoal.toLowerCase() &&
+          (entry.selectedModel || "fast") === selectedModel &&
+          (entry.guideDepth || "Auto") === guideDepth
+      );
+
+      if (match) {
+        setGuide(match.guide);
+        setYoutubeUrl(match.youtubeUrl);
+        setGoal(match.learnerGoal || "Learn the skills from the video");
+        resetGuideInteractions(match.guide);
+        setError(null);
+        setCacheHitNotice({
+          youtubeUrl: match.youtubeUrl,
+          learnerGoal: match.learnerGoal,
+          skillLevel: match.skillLevel,
+          selectedModel: match.selectedModel
+        });
+        return;
+      }
     }
 
     setLoading(true);
@@ -638,13 +787,34 @@ export default function App() {
           youtubeUrl: trimmedUrl,
           learnerGoal: trimmedGoal,
           skillLevel: skillLevel,
-          selectedModel: selectedModel
+          selectedModel: selectedModel,
+          guideDepth: guideDepth
         })
       });
 
-      const data = await response.json();
+      const rawText = await response.text();
+      let data: any;
+      try {
+        data = JSON.parse(rawText);
+      } catch (parseError) {
+        throw new Error("The server returned a non-JSON response. This usually means the video was unavailable, restricted, or the API route failed.");
+      }
 
       if (!response.ok) {
+        const errorMsg = data.error || "";
+        const errorDetails = data.details || "";
+        if (
+          response.status === 429 ||
+          errorMsg.includes("429") ||
+          errorMsg.includes("RESOURCE_EXHAUSTED") ||
+          errorMsg.includes("quota") ||
+          errorMsg.includes("exceeded") ||
+          errorMsg.includes("capacity") ||
+          errorDetails.includes("429") ||
+          errorDetails.includes("quota")
+        ) {
+          throw new Error("OctoSkill is temporarily at capacity. Please try again shortly, or use the sandbox guide below.");
+        }
         throw new Error(data.error || "Failed to generate learning guide.");
       }
 
@@ -696,11 +866,45 @@ export default function App() {
 
       setGuide(mappedGuide);
       setYoutubeUrl(inputUrl);
-      setGoal(inputGoal || "Learn the skills from the video");
+      const detectedGoal = data.learner_goal || inputGoal || "Learn the skills from the video";
+      setGoal(detectedGoal);
       resetGuideInteractions(mappedGuide);
+      setCacheHitNotice(null);
+
+      // Save to cache (Task 6)
+      const updatedCache = [
+        {
+          youtubeUrl: trimmedUrl,
+          learnerGoal: detectedGoal,
+          skillLevel: data.skill_level || skillLevel,
+          selectedModel,
+          guideDepth,
+          guide: mappedGuide,
+          timestamp: Date.now()
+        },
+        ...cache.filter(c => !(
+          c.youtubeUrl.toLowerCase() === trimmedUrl.toLowerCase() &&
+          (c.learnerGoal || "").toLowerCase() === trimmedGoal.toLowerCase() &&
+          (c.selectedModel || "fast") === selectedModel &&
+          (c.guideDepth || "Auto") === guideDepth
+        ))
+      ].slice(0, 20); // Keep last 20 generated roadmaps
+
+      localStorage.setItem(cacheKey, JSON.stringify(updatedCache));
     } catch (err: any) {
       console.error(err);
-      setError(err.message || "An unexpected error occurred. Please check your internet connection.");
+      const msg = err.message || "";
+      if (
+        msg.includes("429") ||
+        msg.includes("quota") ||
+        msg.includes("exhausted") ||
+        msg.includes("capacity")
+      ) {
+        setError("OctoSkill is temporarily at capacity. Please try again shortly, or use the sandbox guide below.");
+      } else {
+        setError(msg || "An unexpected error occurred. Please check your internet connection.");
+      }
+      // Note: We explicitly do NOT clear the existing 'guide' state, preserving loaded data (Task 5)
     } finally {
       setLoading(false);
     }
@@ -801,6 +1005,14 @@ export default function App() {
           md += `### Flashcard ${i + 1}: ${f.front}\n`;
           md += `* **Answer:** ${f.back}\n\n`;
         });
+        if (transcript) {
+          md += `\n---\n\n`;
+          md += `## 9. Video Transcript\n\n`;
+          md += `*Note: ${transcript.language === "en" ? "English" : transcript.language} transcript generated via AI Assistant.*\n\n`;
+          transcript.segments.forEach(seg => {
+            md += `[${seg.start_time} - ${seg.end_time}] **${seg.speaker}**: ${seg.text}\n\n`;
+          });
+        }
         break;
 
       case 'walkthrough':
@@ -911,22 +1123,22 @@ export default function App() {
         <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div className="flex items-center justify-between md:justify-start gap-3 w-full md:w-auto">
             <div onClick={() => { setShowDashboard(false); }} className="cursor-pointer flex items-center gap-3">
-              <div className="p-2.5 bg-indigo-600 text-white rounded-xl shadow-xs">
-                <GraduationCap className="w-7 h-7" id="app-logo-icon" />
-              </div>
-              <div>
-                <h1 className="text-xl md:text-2xl font-display font-bold text-slate-950 tracking-tight" id="app-title">
-                  Octo<span className="text-indigo-600">Skill</span>
-                </h1>
-                <p className="text-xs text-slate-500 font-medium">Paste a tutorial. Get a roadmap. Build the skill.</p>
-              </div>
+              <img 
+                src="/assets/octoskill-logo.png" 
+                alt="OctoSkill logo" 
+                className="h-[60px] w-auto max-w-[240px] object-contain" 
+                id="header-logo-img"
+              />
+              <p className="text-xs text-slate-500 font-medium hidden sm:block border-l border-slate-200 pl-3 py-1">
+                Paste a tutorial. Get a roadmap. Build the skill.
+              </p>
             </div>
           </div>
 
           <div className="flex items-center justify-end gap-3 w-full md:w-auto">
             <span className="hidden lg:inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-100">
               <Cpu className="w-3.5 h-3.5 mr-1 text-indigo-500 animate-pulse" />
-              Gemini 3.5 & Search Grounded
+              AI Powered & Verified
             </span>
 
             {/* Save current progress if a guide exists */}
@@ -1230,7 +1442,7 @@ export default function App() {
 
           <form onSubmit={handleGenerate} className="p-6 border-b border-slate-100 space-y-4">
             <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-              <div className="md:col-span-4 space-y-1">
+              <div className="md:col-span-8 space-y-1">
                 <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block">
                   YouTube Video Link
                 </label>
@@ -1249,51 +1461,72 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="md:col-span-3 space-y-1">
-                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block">
-                  What are you trying to learn? <span className="text-slate-400 font-normal">(Optional)</span>
-                </label>
-                <input
-                  type="text"
-                  value={inputGoal}
-                  onChange={(e) => setInputGoal(e.target.value)}
-                  placeholder="e.g. Build a wooden planter box, learn hooks"
-                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all outline-hidden text-slate-900 placeholder:text-slate-400 font-medium"
-                  id="learning-goal-input"
-                />
-              </div>
-
-              <div className="md:col-span-2 space-y-1">
-                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block">
-                  Skill Level
-                </label>
-                <select
-                  value={skillLevel}
-                  onChange={(e) => setSkillLevel(e.target.value)}
-                  className="w-full px-3 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all outline-hidden text-slate-900 font-medium cursor-pointer"
-                  id="skill-level-select"
-                >
-                  <option value="Beginner">Beginner</option>
-                  <option value="Intermediate">Intermediate</option>
-                  <option value="Advanced">Advanced</option>
-                </select>
-              </div>
-
-              <div className="md:col-span-3 space-y-1">
+              <div className="md:col-span-4 space-y-1">
                 <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block flex items-center gap-1">
-                  Gemini Intelligence Mode
+                  Guide Type
                 </label>
                 <select
                   value={selectedModel}
                   onChange={(e) => setSelectedModel(e.target.value)}
                   className="w-full px-3 py-3 bg-indigo-50/50 border border-indigo-200 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all outline-hidden text-slate-900 font-medium cursor-pointer"
-                  id="gemini-intelligence-select"
+                  id="guide-type-select"
                 >
-                  <option value="gemini-3.5-flash">🚀 Balanced (Gemini 3.5 Flash)</option>
-                  <option value="gemini-3.1-pro-preview">🔬 Deep Video Understanding (Gemini 3.1 Pro)</option>
-                  <option value="gemini-3.1-flash-lite">⚡ Ultra-Fast Overview (Gemini 3.1 Flash Lite)</option>
+                  <option value="fast">⚡ Quick Roadmap</option>
+                  <option value="deep">🧠 Deep Learning Guide</option>
+                  <option value="grounded">🔍 Verified Guide</option>
                 </select>
+                <p className="text-[11px] text-slate-500 font-medium leading-normal mt-1">
+                  {selectedModel === "fast" && "Fast guide with steps, checklist, quiz, and flashcards."}
+                  {selectedModel === "deep" && "More detailed explanations, concepts, practice tasks, and troubleshooting."}
+                  {selectedModel === "grounded" && "Uses web search to verify tools, links, software versions, and resources."}
+                </p>
               </div>
+            </div>
+
+            {/* Customize guide collapsible */}
+            <div className="border-t border-slate-100 pt-3 mt-1">
+              <button
+                type="button"
+                onClick={() => setIsCustomizeOpen(!isCustomizeOpen)}
+                className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-slate-900 transition-colors cursor-pointer"
+              >
+                <ChevronDown className={`w-4 h-4 transition-transform duration-200 ${isCustomizeOpen ? "rotate-180" : ""}`} />
+                <span>Customize guide</span>
+              </button>
+              
+              {isCustomizeOpen && (
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-4 mt-3 pt-1 animate-fadeIn">
+                  <div className="md:col-span-8 space-y-1">
+                    <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block">
+                      Focus area
+                    </label>
+                    <input
+                      type="text"
+                      value={inputGoal}
+                      onChange={(e) => setInputGoal(e.target.value)}
+                      placeholder="Optional: Tell OctoSkill what part of the video you care about most."
+                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all outline-hidden text-slate-900 placeholder:text-slate-400 font-medium"
+                      id="learning-goal-input"
+                    />
+                  </div>
+                  
+                  <div className="md:col-span-4 space-y-1">
+                    <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block">
+                      Guide depth
+                    </label>
+                    <select
+                      value={guideDepth}
+                      onChange={(e) => setGuideDepth(e.target.value)}
+                      className="w-full px-3 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all outline-hidden text-slate-900 font-medium cursor-pointer"
+                      id="guide-depth-select"
+                    >
+                      <option value="Auto">Auto</option>
+                      <option value="Simple">Simple</option>
+                      <option value="Detailed">Detailed</option>
+                    </select>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between pt-2 gap-4">
@@ -1324,17 +1557,37 @@ export default function App() {
                 {loading ? (
                   <>
                     <RefreshCw className="w-4 h-4 mr-2.5 animate-spin" />
-                    Analyzing & Generating Guide...
+                    Generating...
                   </>
                 ) : (
                   <>
                     <Sparkles className="w-4 h-4 mr-2" />
-                    Generate Structured Guide
+                    Generate Guide
                   </>
                 )}
               </button>
             </div>
           </form>
+
+          {/* Cache hit notice (Task 6) */}
+          {cacheHitNotice && (
+            <div className="p-4 bg-indigo-50/70 border-t border-indigo-100/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs font-medium text-indigo-950">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-indigo-600 animate-bounce shrink-0" />
+                <span>Roadmap loaded instantly from cache. Want to run a fresh generation?</span>
+              </div>
+              <button
+                type="button"
+                onClick={(e) => {
+                  setCacheHitNotice(null);
+                  handleGenerate(e, true);
+                }}
+                className="inline-flex items-center justify-center px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[11px] rounded-lg transition-all shadow-xs active:scale-95 cursor-pointer animate-pulse"
+              >
+                Regenerate anyway
+              </button>
+            </div>
+          )}
 
           {/* Loading status details */}
           {loading && (
@@ -1349,7 +1602,7 @@ export default function App() {
               <div>
                 <p className="text-xs font-semibold text-indigo-950">Active Video Parsing</p>
                 <p className="text-xs text-indigo-700 mt-0.5">
-                  Gemini is searching YouTube transcripts and visual chapters to construct your study curriculum. This safe server-side query takes about 15-20 seconds.
+                  Our AI is searching YouTube transcripts and visual chapters to construct your study curriculum. This safe server-side query takes about 15-20 seconds.
                 </p>
               </div>
             </motion.div>
@@ -1362,9 +1615,9 @@ export default function App() {
               <div className="space-y-1 w-full">
                 <h4 className="text-sm font-semibold text-rose-950">Generation Issue</h4>
                 <p className="text-xs leading-relaxed">{error}</p>
-                {error.includes("GEMINI_API_KEY") && (
-                  <p className="text-xs text-rose-700 mt-1">
-                    To connect your own keys, navigate to the **Settings &gt; Secrets** panel in the Google AI Studio sidebar and add **GEMINI_API_KEY**. In the meantime, you can instantly try our two high-quality samples below the form!
+                {error.includes("capacity") && (
+                  <p className="text-xs text-rose-700 mt-1 font-semibold animate-pulse">
+                    Please use the sandbox guide below to test the full interactive feature set of OctoSkill without hitting rate limits!
                   </p>
                 )}
                 <div className="pt-2">
@@ -1553,7 +1806,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* AI Video Inspector (Gemini 3.1 Pro Video Understanding) */}
+            {/* AI Video Inspector (Video Understanding) */}
             <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs p-5 space-y-4 no-print">
               <div className="border-b border-slate-100 pb-3">
                 <h4 className="text-sm font-display font-bold text-slate-950 flex items-center gap-2">
@@ -1563,7 +1816,7 @@ export default function App() {
                   AI Video Inspector
                 </h4>
                 <p className="text-[11px] text-slate-400 mt-1 font-medium">
-                  Ask **Gemini Pro** to inspect the source video for safety warnings, alternative materials, or technical details.
+                  Ask our AI Assistant to inspect the source video for safety warnings, alternative materials, or technical details.
                 </p>
               </div>
 
@@ -1574,21 +1827,21 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => handleAskVideo("Are there any safety warnings or gear omitted from this tutorial?")}
-                    className="text-left text-[11px] font-semibold text-slate-600 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50/50 p-2 rounded-lg border border-slate-200/50 transition-all text-left cursor-pointer"
+                    className="text-left text-[11px] font-semibold text-slate-600 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50/50 p-2 rounded-lg border border-slate-200/50 transition-all cursor-pointer"
                   >
                     ⚠️ Verify missing safety warnings/gear
                   </button>
                   <button
                     type="button"
                     onClick={() => handleAskVideo("What alternative tools or materials can I use if I don't have the ones listed in the guide?")}
-                    className="text-left text-[11px] font-semibold text-slate-600 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50/50 p-2 rounded-lg border border-slate-200/50 transition-all text-left cursor-pointer"
+                    className="text-left text-[11px] font-semibold text-slate-600 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50/50 p-2 rounded-lg border border-slate-200/50 transition-all cursor-pointer"
                   >
                     🛠️ Find alternative tools/materials
                   </button>
                   <button
                     type="button"
                     onClick={() => handleAskVideo("Explain the core logic, theory, math, or technology rules of how this works.")}
-                    className="text-left text-[11px] font-semibold text-slate-600 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50/50 p-2 rounded-lg border border-slate-200/50 transition-all text-left cursor-pointer"
+                    className="text-left text-[11px] font-semibold text-slate-600 hover:text-indigo-600 bg-slate-50 hover:bg-indigo-50/50 p-2 rounded-lg border border-slate-200/50 transition-all cursor-pointer"
                   >
                     📐 Explain science/programming theory
                   </button>
@@ -1602,7 +1855,7 @@ export default function App() {
                     type="text"
                     value={askQuestion}
                     onChange={(e) => setAskQuestion(e.target.value)}
-                    placeholder="Ask Gemini Pro about this video..."
+                    placeholder="Ask our AI Assistant about this video..."
                     className="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all outline-hidden text-slate-900 font-medium placeholder:text-slate-400"
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !askLoading) {
@@ -1640,7 +1893,7 @@ export default function App() {
               {(askAnswer || askLoading) && (
                 <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200/60 max-h-[250px] overflow-y-auto space-y-2">
                   <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block border-b border-slate-200/40 pb-1">
-                    Gemini Pro Insights
+                    AI Assistant Insights
                   </span>
                   {askLoading ? (
                     <div className="flex items-center gap-2 text-xs text-indigo-600 font-semibold py-1">
@@ -1719,6 +1972,18 @@ export default function App() {
               >
                 <BookOpen className="w-4 h-4" />
                 Flashcards
+              </button>
+
+              <button
+                onClick={() => setActiveTab('transcript')}
+                className={`flex-1 min-w-[120px] inline-flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                  activeTab === 'transcript' 
+                  ? "bg-slate-900 text-white shadow-xs" 
+                  : "text-slate-600 hover:text-slate-950 hover:bg-slate-50"
+                }`}
+              >
+                <FileText className="w-4 h-4" />
+                Transcript
               </button>
             </div>
 
@@ -1862,7 +2127,7 @@ export default function App() {
                                   </button>
                                   <span className="text-[10px] font-bold text-indigo-700 uppercase tracking-wider block flex items-center gap-1">
                                     <Sparkles className="w-3.5 h-3.5 fill-indigo-500" />
-                                    Gemini Step Refinement (Action details & Verification criteria)
+                                    AI Step Refinement (Action details & Verification criteria)
                                   </span>
                                   <div className="space-y-1">
                                     {renderFormattedAnswer(refinedSteps[s.step_number].explanation!)}
@@ -1871,7 +2136,7 @@ export default function App() {
                               ) : refinedSteps[s.step_number]?.loading ? (
                                 <div className="flex items-center gap-2 text-xs font-bold text-indigo-600 bg-indigo-50/40 p-3 rounded-xl border border-indigo-100/50">
                                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                  Gemini is refining action details for Step {s.step_number}...
+                                  AI is refining action details for Step {s.step_number}...
                                 </div>
                               ) : (
                                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -1991,7 +2256,7 @@ export default function App() {
                         AI Milestone Restructuring
                       </h4>
                       <p className="text-[11px] text-slate-500 font-medium">
-                        Use **Gemini Flash Lite** to analyze milestone items and sort them logically.
+                        Use our AI engine to analyze milestone items and sort them logically.
                       </p>
                     </div>
 
@@ -2271,6 +2536,222 @@ export default function App() {
                   </div>
                 </div>
               )}
+
+              {/* Tab 6: Transcript Tab */}
+              {(activeTab === 'transcript' && !window.matchMedia('print').matches) && (
+                <div className="space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+                    <div className="space-y-0.5">
+                      <h3 className="text-lg font-display font-bold text-slate-950 flex items-center gap-2">
+                        <FileText className="w-5 h-5 text-indigo-600" />
+                        Video Transcript
+                      </h3>
+                      <p className="text-xs text-slate-500 font-medium">
+                        Analyze and browse the spoken details of this video.
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 no-print">
+                      {transcript && (
+                        <>
+                          <button
+                            onClick={() => {
+                              const textToCopy = transcript.segments
+                                .map(seg => `[${seg.start_time} - ${seg.end_time}] ${seg.speaker}: ${seg.text}`)
+                                .join("\n");
+                              navigator.clipboard.writeText(textToCopy);
+                              showToast("Full transcript copied to clipboard!");
+                            }}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded-xl transition-all active:scale-95 cursor-pointer"
+                            title="Copy transcript to clipboard"
+                          >
+                            <Copy className="w-3.5 h-3.5 text-slate-500" />
+                            Copy Full
+                          </button>
+                          
+                          <button
+                            onClick={() => {
+                              const textContent = transcript.segments
+                                .map(seg => `[${seg.start_time} - ${seg.end_time}] ${seg.speaker}: ${seg.text}`)
+                                .join("\n");
+                              const blob = new Blob([textContent], { type: "text/plain;charset=utf-8;" });
+                              const url = URL.createObjectURL(blob);
+                              const link = document.createElement("a");
+                              link.href = url;
+                              link.setAttribute("download", `${guide.title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-transcript.txt`);
+                              document.body.appendChild(link);
+                              link.click();
+                              document.body.removeChild(link);
+                              showToast("Transcript downloaded!");
+                            }}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded-xl transition-all active:scale-95 cursor-pointer"
+                            title="Download transcript as txt"
+                          >
+                            <Download className="w-3.5 h-3.5 text-slate-500" />
+                            Download .txt
+                          </button>
+
+                          <button
+                            onClick={() => handleGenerateTranscript(true)}
+                            disabled={transcriptLoading}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200/40 font-semibold text-xs rounded-xl transition-all active:scale-95 cursor-pointer"
+                            title="Regenerate transcript"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            Regenerate
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Accuracy note */}
+                  <div className="bg-amber-50/50 border border-amber-200/60 p-3.5 rounded-xl text-xs font-semibold text-amber-900 leading-relaxed flex items-start gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+                    <span>
+                      <strong>Accuracy Note:</strong> This transcript is AI-generated and may contain small errors. Always check the original video for critical details.
+                    </span>
+                  </div>
+
+                  {/* If Transcript doesn't exist */}
+                  {!transcript && !transcriptLoading && (
+                    <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center space-y-4 shadow-3xs max-w-xl mx-auto my-6">
+                      <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-full flex items-center justify-center mx-auto">
+                        <FileText className="w-6 h-6" />
+                      </div>
+                      <div className="space-y-1.5">
+                        <h4 className="text-sm font-bold text-slate-900">No Transcript Loaded</h4>
+                        <p className="text-xs text-slate-500 leading-relaxed max-w-sm mx-auto font-medium">
+                          You can generate an accurate, timestamped transcript of this YouTube video on-demand. This takes about 10-30 seconds.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleGenerateTranscript(false)}
+                        className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl shadow-sm active:scale-95 transition-all cursor-pointer"
+                      >
+                        <Cpu className="w-4 h-4 animate-pulse" />
+                        Generate Transcript
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Loading State */}
+                  {transcriptLoading && (
+                    <div className="bg-slate-50 border border-slate-200 rounded-2xl p-12 text-center space-y-4 max-w-md mx-auto my-6">
+                      <RefreshCw className="w-8 h-8 text-indigo-600 animate-spin mx-auto" />
+                      <div className="space-y-1">
+                        <p className="text-sm font-bold text-slate-800">Generating transcript...</p>
+                        <p className="text-xs text-slate-400 font-medium">Our AI is transcribing spoken video content and aligning timecodes.</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Error State */}
+                  {transcriptError && (
+                    <div className="bg-rose-50 border border-rose-100 rounded-2xl p-6 text-center space-y-3 max-w-lg mx-auto my-4">
+                      <AlertTriangle className="w-8 h-8 text-rose-500 mx-auto" />
+                      <div className="space-y-1">
+                        <p className="text-sm font-bold text-rose-950">Transcription failed</p>
+                        <p className="text-xs text-rose-700 leading-relaxed font-semibold">{transcriptError}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleGenerateTranscript(true)}
+                        className="inline-flex items-center gap-2 px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl transition-all cursor-pointer"
+                      >
+                        Try Again
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Search and segments render */}
+                  {transcript && !transcriptLoading && (
+                    <div className="space-y-4">
+                      {/* Search box within transcript */}
+                      <div className="relative">
+                        <input
+                          type="text"
+                          placeholder="Search keywords in transcript..."
+                          value={transcriptSearchQuery}
+                          onChange={(e) => setTranscriptSearchQuery(e.target.value)}
+                          className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:bg-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all outline-hidden text-slate-900 font-semibold placeholder:text-slate-400"
+                        />
+                      </div>
+
+                      {/* Filter segments based on query */}
+                      {(() => {
+                        const query = transcriptSearchQuery.trim().toLowerCase();
+                        const filteredSegments = transcript.segments.filter(seg => 
+                          seg.text.toLowerCase().includes(query) || 
+                          seg.speaker.toLowerCase().includes(query) ||
+                          seg.start_time.includes(query)
+                        );
+
+                        if (filteredSegments.length === 0) {
+                          return (
+                            <div className="bg-slate-50 border border-slate-100 rounded-2xl p-8 text-center">
+                              <p className="text-xs font-semibold text-slate-500">No matching transcript sections found for your search.</p>
+                            </div>
+                          );
+                        }
+
+                        return (
+                          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden divide-y divide-slate-100 max-h-[600px] overflow-y-auto">
+                            {filteredSegments.map((seg, sIdx) => {
+                              // Highlight text if search query exists
+                              let textElement: import("react").ReactNode = seg.text;
+                              if (query) {
+                                const index = seg.text.toLowerCase().indexOf(query);
+                                if (index >= 0) {
+                                  const before = seg.text.substring(0, index);
+                                  const match = seg.text.substring(index, index + query.length);
+                                  const after = seg.text.substring(index + query.length);
+                                  textElement = (
+                                    <span>
+                                      {before}
+                                      <mark className="bg-yellow-100 text-yellow-950 font-bold px-0.5 rounded-sm">{match}</mark>
+                                      {after}
+                                    </span>
+                                  );
+                                }
+                              }
+
+                              return (
+                                <div key={sIdx} className="p-4 hover:bg-slate-50/40 transition-colors flex items-start gap-4">
+                                  {/* Timestamp badge */}
+                                  <a
+                                    href={getYouTubeSecondsLink(youtubeUrl, seg.start_time)}
+                                    target="_blank"
+                                    rel="noreferrer referrer"
+                                    className="shrink-0 px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-xs rounded-lg transition-colors border border-indigo-100/50 flex items-center gap-1 font-mono"
+                                    title="Jump to this segment on YouTube"
+                                  >
+                                    <Play className="w-2.5 h-2.5 fill-indigo-700 text-indigo-700" />
+                                    {seg.start_time}
+                                  </a>
+
+                                  {/* Speaker & text content */}
+                                  <div className="min-w-0 flex-1 space-y-1">
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[10px] font-extrabold text-indigo-600 uppercase tracking-widest bg-indigo-50/50 px-1.5 py-0.5 rounded-sm">
+                                        {seg.speaker}
+                                      </span>
+                                    </div>
+                                    <p className="text-xs md:text-sm text-slate-700 font-medium leading-relaxed">
+                                      {textElement}
+                                    </p>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </section>
@@ -2279,9 +2760,19 @@ export default function App() {
       </main>
 
       {/* Footer */}
-      <footer className="no-print bg-white border-t border-slate-200 py-6 px-6 mt-12 text-center text-xs text-slate-400">
-        <p className="font-semibold">OctoSkill © 2026 • AI-Powered Curriculum Development</p>
-        <p className="mt-1">Crafted with precision using Google GenAI & search-grounded model synthesis.</p>
+      <footer className="no-print bg-white border-t border-slate-200 py-8 px-6 mt-12 text-center text-xs text-slate-400">
+        <div className="max-w-7xl mx-auto flex flex-col items-center gap-4">
+          <img 
+            src="/assets/octoskill-logo.png" 
+            alt="OctoSkill logo" 
+            className="h-8 w-auto max-w-[130px] object-contain mb-1" 
+            id="footer-logo-img"
+          />
+          <div className="space-y-1">
+            <p className="font-semibold text-slate-500">OctoSkill © 2026 • AI-Powered Curriculum Development</p>
+            <p className="text-slate-400">Crafted with precision using advanced AI curriculum synthesis.</p>
+          </div>
+        </div>
       </footer>
 
       {/* Toast Notification */}

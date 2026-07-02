@@ -230,16 +230,71 @@ const MOCK_PLANTER_GUIDE = {
 };
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
+
 app.use(express.json());
+
+function isValidYouTubeUrl(url: any): boolean {
+  if (!url || typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  return trimmed.includes("youtube.com/watch?v=") || trimmed.includes("youtu.be/");
+}
 
 // API route to generate guide
 app.post("/api/generate-guide", async (req, res) => {
   try {
-    const { youtubeUrl, learnerGoal, skillLevel, selectedModel } = req.body;
+    const { youtubeUrl, learnerGoal, skillLevel, selectedModel, guideDepth } = req.body;
+
+    // TODO: FUTURE SAAS USAGE LIMITS FOR SUBSCRIPTION TIERS:
+    // - Free Tier users: limit to 3 guides/month. Check billing/usage DB.
+    // - Builder Tier users: limit to 25 guides/month.
+    // - Pro Tier users: higher/unlimited guides/month + allow Search Grounding (useGoogleSearch = true).
+    // if (user.tier === 'free' && monthlyCount >= 3) {
+    //   return res.status(403).json({ error: "Limit reached", details: "Free users are limited to 3 guides/month. Upgrade to Builder or Pro for more!" });
+    // }
+
+    // Map selectedModel/Intelligence modes (Task 2 & 3):
+    // "fast": Fast Guide using lowest-cost stable Flash/Flash-Lite model (gemini-2.5-flash-lite) and NO googleSearch grounding.
+    // "deep": Detailed guide with standard Flash model (gemini-2.5-flash) and NO googleSearch grounding.
+    // "grounded": Search-Grounded Guide using standard Flash model (gemini-2.5-flash) with googleSearch grounding.
+    let chosenModel = "gemini-2.5-flash-lite"; // Default lowest-cost stable Flash/Flash-Lite model
+    let useGoogleSearch = false;
+
+    if (selectedModel === "grounded") {
+      chosenModel = "gemini-2.5-flash"; // Use stable Flash for grounding
+      useGoogleSearch = true;
+    } else if (selectedModel === "deep") {
+      chosenModel = "gemini-2.5-flash"; // Use stable Flash for deeper explanation
+      useGoogleSearch = false;
+    } else if (selectedModel === "fast") {
+      chosenModel = "gemini-2.5-flash-lite"; // Lowest-cost stable Flash-Lite
+      useGoogleSearch = false;
+    } else if (selectedModel) {
+      chosenModel = selectedModel;
+      if (selectedModel === "gemini-3.5-flash" || selectedModel === "gemini-3.1-pro-preview") {
+        useGoogleSearch = true;
+      }
+    }
+
+    // Logging (Task 6)
+    console.log(`[LOG] /api/generate-guide called with URL: ${youtubeUrl}`);
+    console.log(`[LOG] Selected mode: ${selectedModel || 'default'}`);
+    console.log(`[LOG] Mapped model: ${chosenModel}`);
+    console.log(`[LOG] Google Search grounding enabled: ${useGoogleSearch}`);
+    console.log(`[LOG] GEMINI_API_KEY exists: ${!!process.env.GEMINI_API_KEY}`);
 
     if (!youtubeUrl) {
-      return res.status(400).json({ error: "YouTube URL is required." });
+      return res.status(400).json({
+        error: "YouTube URL is required.",
+        details: "Please provide a YouTube URL."
+      });
+    }
+
+    if (!isValidYouTubeUrl(youtubeUrl)) {
+      return res.status(400).json({
+        error: "Invalid YouTube URL.",
+        details: "Please provide a valid YouTube URL containing youtube.com/watch?v= or youtu.be/."
+      });
     }
 
     // Mock mode check if GEMINI_API_KEY is not defined
@@ -254,11 +309,30 @@ app.post("/api/generate-guide", async (req, res) => {
     try {
       ai = getGeminiClient();
     } catch (err: any) {
-      return res.status(401).json({ error: err.message });
+      return res.status(401).json({
+        error: "Gemini client initialization failed.",
+        details: err.message
+      });
     }
 
     const targetGoal = learnerGoal || "Learn the project/skills shown in the video";
     const targetSkillLevel = skillLevel || "Intermediate";
+
+    let modelInstructions = "";
+    if (selectedModel === "fast") {
+      modelInstructions = "\n- Provide a quick, concise, action-oriented roadmap. Focus on practical steps, brief checklist items, simple quiz questions, and direct flashcards.";
+    } else if (selectedModel === "deep") {
+      modelInstructions = "\n- Provide a comprehensive, deep learning guide. Include rich and detailed step-by-step instructions, thorough explanations of key concepts, more challenging practice tasks, and specific troubleshooting tips.";
+    } else if (selectedModel === "grounded") {
+      modelInstructions = "\n- Use web search grounding to verify real-world tools, links, software versions, safety warnings, and resources mentioned in the video.";
+    }
+
+    let depthInstructions = "";
+    if (guideDepth === "Simple") {
+      depthInstructions = "\n- Keep all explanations, steps, and concept descriptions short, simple, and direct.";
+    } else if (guideDepth === "Detailed") {
+      depthInstructions = "\n- Provide highly detailed, in-depth, and thorough explanations, step walkthroughs, and conceptual definitions.";
+    }
 
     const prompt = `
 You are OctoSkill, an expert instructional designer and project-based learning coach.
@@ -271,7 +345,7 @@ You are creating a practical project guide that helps the learner actually compl
 Inputs:
 YouTube URL: ${youtubeUrl}
 Learner goal: ${targetGoal}
-Skill level: ${targetSkillLevel}
+Skill level: ${targetSkillLevel} (Note: Feel free to adjust the auto-detected skill_level in your response to be Beginner, Beginner-Intermediate, Intermediate, or Advanced depending on the tutorial content).
 
 Create a structured learning guide with the following goals:
 - Explain what the learner will build or learn.
@@ -286,6 +360,8 @@ Create a structured learning guide with the following goals:
 - Create a short quiz with answers.
 - Suggest next learning steps.
 
+Guide Type & Depth Instructions:${modelInstructions}${depthInstructions}
+
 Important rules:
 - Be practical and action-oriented.
 - Use timestamps wherever possible.
@@ -296,12 +372,11 @@ Important rules:
 - Return only valid JSON matching the provided schema.
 `;
 
-    const chosenModel = selectedModel || "gemini-3.5-flash";
     const response = await ai.models.generateContent({
       model: chosenModel,
       contents: prompt,
       config: {
-        tools: [{ googleSearch: {} }],
+        ...(useGoogleSearch ? { tools: [{ googleSearch: {} }] } : {}),
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -431,41 +506,224 @@ Important rules:
 
     const text = response.text;
     if (!text) {
-      throw new Error("No output received from the model. Please verify your video and try again.");
+      console.error("[LOG] Gemini returned an empty response text.");
+      return res.status(500).json({
+        error: "Video unavailable or Gemini returned a non-JSON response.",
+        details: "The model did not return any text response."
+      });
     }
 
     try {
       const guide = JSON.parse(text);
       res.json(guide);
-    } catch (parseError) {
-      console.error("Structured JSON parse failure:", parseError, text);
-      throw new Error("Structured JSON parse failure: The AI model's response could not be parsed into the required learning schema. Please try again.");
+    } catch (parseError: any) {
+      console.error("[LOG] Gemini returned a non-JSON response. Raw text response:", text);
+      res.status(500).json({
+        error: "Video unavailable or Gemini returned a non-JSON response.",
+        details: parseError.message || "Failed to parse the Gemini output as structured JSON."
+      });
     }
 
   } catch (error: any) {
-    console.error("Error generating learning guide:", error);
-    let errorMessage = error.message || "Failed to generate guide.";
-    
-    // Check for rate limit / quota issues
+    console.error("[LOG] Error in /api/generate-guide caught:", error);
+    let errorMessage = "Video unavailable or Gemini returned a non-JSON response.";
+    let details = error.message || "An unexpected error occurred.";
+
     if (
-      errorMessage.includes("429") || 
-      errorMessage.includes("RESOURCE_EXHAUSTED") || 
-      errorMessage.includes("quota") ||
-      errorMessage.includes("exceeded") ||
-      errorMessage.includes("Rate limit")
+      details.includes("429") || 
+      details.includes("RESOURCE_EXHAUSTED") || 
+      details.includes("quota") ||
+      details.includes("exceeded") ||
+      details.includes("Rate limit")
     ) {
-      errorMessage = "Gemini API rate limit or quota exceeded. You've exceeded your current free-tier quota. Please wait a moment and try again, or connect your own API key under Settings > Secrets. In the meantime, you can instantly test with our premium pre-built cedar planter sandbox guide below!";
-    }
-    // Check for unavailable video or invalid url
-    else if (errorMessage.includes("NOT_FOUND") || errorMessage.includes("unavailable") || errorMessage.includes("not found")) {
-      errorMessage = "Video or Resource Unavailable: The specified YouTube video could not be found, or has been restricted by its publisher. Please check the URL and try again.";
-    }
-    // Generic Gemini API error
-    else if (errorMessage.includes("API") || errorMessage.includes("GoogleGenAI") || errorMessage.includes("model")) {
-      errorMessage = `Gemini API Error: ${errorMessage}`;
+      errorMessage = "OctoSkill is temporarily at capacity. Please try again shortly, or use the sandbox guide below.";
+      details = "OctoSkill is temporarily at capacity. Please try again shortly, or use the sandbox guide below.";
+    } else if (
+      details.includes("NOT_FOUND") || 
+      details.includes("unavailable") || 
+      details.includes("not found")
+    ) {
+      errorMessage = "Video unavailable or Gemini returned a non-JSON response.";
+      details = "The specified YouTube video could not be found, is restricted, or the API route failed.";
     }
 
-    res.status(500).json({ error: errorMessage });
+    res.status(500).json({
+      error: errorMessage,
+      details: details
+    });
+  }
+});
+
+// API Route: Generate timestamped video transcript using lowest-cost stable model (gemini-3.1-flash-lite)
+app.post("/api/generate-transcript", async (req, res) => {
+  try {
+    const { youtubeUrl, language } = req.body;
+
+    if (!youtubeUrl) {
+      return res.status(400).json({ error: "YouTube URL is required." });
+    }
+
+    if (!isValidYouTubeUrl(youtubeUrl)) {
+      return res.status(400).json({
+        error: "Invalid YouTube URL format.",
+        details: "Please provide a valid YouTube URL (e.g., https://www.youtube.com/watch?v=... or https://youtu.be/...)."
+      });
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      // Sandbox fallback matching requested schema
+      return res.json({
+        status: "available",
+        source_type: "ai_generated",
+        language: language || "en",
+        segments: [
+          {
+            start_time: "00:00",
+            end_time: "00:15",
+            speaker: "Instructor",
+            text: "Welcome back to the workshop! Today, we're building a classic cedar planter box from scratch."
+          },
+          {
+            start_time: "00:15",
+            end_time: "00:35",
+            speaker: "Instructor",
+            text: "First, we'll review the materials. We're using standard 1x6 cedar boards, which are naturally rot-resistant and perfect for outdoor use."
+          },
+          {
+            start_time: "00:35",
+            end_time: "01:05",
+            speaker: "Instructor",
+            text: "Next, we'll make our cuts. We need four side panels cut at eighteen inches, and three bottom pieces cut at sixteen inches."
+          },
+          {
+            start_time: "01:05",
+            end_time: "01:30",
+            speaker: "Instructor",
+            text: "Now, let's assemble the sides using pocket hole screws. This ensures a strong, hidden joint that will withstand the weather."
+          },
+          {
+            start_time: "01:30",
+            end_time: "02:00",
+            speaker: "Instructor",
+            text: "Finally, we will drill drainage holes in the bottom, sand the rough edges, and apply a natural outdoor wood finish."
+          }
+        ],
+        full_text: "Welcome back to the workshop! Today, we're building a classic cedar planter box from scratch. First, we'll review the materials. We're using standard 1x6 cedar boards, which are naturally rot-resistant and perfect for outdoor use. Next, we'll make our cuts. We need four side panels cut at eighteen inches, and three bottom pieces cut at sixteen inches. Now, let's assemble the sides using pocket hole screws. This ensures a strong, hidden joint that will withstand the weather. Finally, we will drill drainage holes in the bottom, sand the rough edges, and apply a natural outdoor wood finish."
+      });
+    }
+
+    const ai = getGeminiClient();
+    const prompt = `You are OctoSkill’s transcription engine.
+
+Transcribe the spoken audio from this YouTube video as accurately as possible.
+YouTube Video URL: ${youtubeUrl}
+
+Rules:
+- Return only valid JSON.
+- Do not summarize.
+- Do not explain the video.
+- Do not create a roadmap.
+- Transcribe the spoken words.
+- Add timestamps every 10 to 30 seconds where possible.
+- Use clean punctuation.
+- If a word is unclear, use "[unclear]".
+- If there is no speech in a section, omit that section.
+- Use speaker labels only if obvious, otherwise use "Instructor".
+- Preserve important technical terms, commands, product names, measurements, and code-related words as accurately as possible.
+
+Return this JSON structure:
+{
+  "status": "available",
+  "source_type": "ai_generated",
+  "language": "${language || 'en'}",
+  "segments": [
+    {
+      "start_time": "00:00",
+      "end_time": "00:12",
+      "speaker": "Instructor",
+      "text": ""
+    }
+  ],
+  "full_text": ""
+}`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-flash-lite",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            status: { type: Type.STRING },
+            source_type: { type: Type.STRING },
+            language: { type: Type.STRING },
+            segments: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  start_time: { type: Type.STRING },
+                  end_time: { type: Type.STRING },
+                  speaker: { type: Type.STRING },
+                  text: { type: Type.STRING }
+                },
+                required: ["start_time", "end_time", "speaker", "text"]
+              }
+            },
+            full_text: { type: Type.STRING }
+          },
+          required: ["status", "source_type", "language", "segments", "full_text"]
+        }
+      }
+    });
+
+    const text = response.text;
+    if (!text) {
+      return res.status(500).json({
+        error: "Video unavailable or Gemini returned a non-JSON response.",
+        details: "The model did not return any text response."
+      });
+    }
+
+    try {
+      const transcriptData = JSON.parse(text);
+      res.json(transcriptData);
+    } catch (parseError: any) {
+      console.error("[LOG] Gemini returned non-JSON transcript response. Raw response:", text);
+      res.status(500).json({
+        error: "Video unavailable or Gemini returned a non-JSON response.",
+        details: parseError.message || "Failed to parse the Gemini output as structured transcript JSON."
+      });
+    }
+  } catch (error: any) {
+    console.error("[LOG] Error in /api/generate-transcript caught:", error);
+    let errorMessage = "Video unavailable or Gemini returned a non-JSON response.";
+    let details = error.message || "An unexpected error occurred.";
+
+    if (
+      details.includes("429") || 
+      details.includes("RESOURCE_EXHAUSTED") || 
+      details.includes("quota") ||
+      details.includes("exceeded") ||
+      details.includes("Rate limit")
+    ) {
+      errorMessage = "OctoSkill is temporarily at capacity. Please try again shortly, or use the sandbox guide below.";
+      details = "OctoSkill is temporarily at capacity. Please try again shortly, or use the sandbox guide below.";
+    } else if (
+      details.includes("NOT_FOUND") || 
+      details.includes("unavailable") || 
+      details.includes("not found")
+    ) {
+      errorMessage = "Video unavailable or Gemini returned a non-JSON response.";
+      details = "The specified YouTube video could not be found, is restricted, or the API route failed.";
+    }
+
+    res.status(500).json({
+      error: errorMessage,
+      details: details
+    });
   }
 });
 
@@ -480,7 +738,7 @@ app.post("/api/ask-video", async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return res.json({
-        answer: `[DEMO MODE] This is a sandbox response since no GEMINI_API_KEY is defined in Settings > Secrets. In a configured environment, **Gemini 3.1 Pro** analyzes the video URL \`${youtubeUrl || 'Unknown'}\` and context details to answer your inquiry: "${question}".\n\nHere is a default answer:\n- **Safety Note**: Ensure proper ventilation and safety glasses whenever executing tasks.\n- **Substitutes**: If missing specific tools, generic hardware/substitutes usually work.`
+        answer: `[DEMO MODE] This is a sandbox response since no API key is configured. In a live environment, **OctoSkill AI** analyzes the video URL \`${youtubeUrl || 'Unknown'}\` and context details to answer your inquiry: "${question}".\n\nHere is a default answer:\n- **Safety Note**: Ensure proper ventilation and safety glasses whenever executing tasks.\n- **Substitutes**: If missing specific tools, generic hardware/substitutes usually work.`
       });
     }
 
