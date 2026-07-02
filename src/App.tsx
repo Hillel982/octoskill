@@ -1124,9 +1124,10 @@ export default function App() {
           <div className="flex items-center justify-between md:justify-start gap-3 w-full md:w-auto">
             <div onClick={() => { setShowDashboard(false); }} className="cursor-pointer flex items-center gap-3">
               <img 
-                src="/assets/octoskill-logo.png" 
+                src="/assets/octoskill logo.png" 
                 alt="OctoSkill logo" 
-                className="h-[60px] w-auto max-w-[240px] object-contain" 
+                className="w-[160px] h-auto object-contain" 
+                referrerPolicy="no-referrer"
                 id="header-logo-img"
               />
               <p className="text-xs text-slate-500 font-medium hidden sm:block border-l border-slate-200 pl-3 py-1">
@@ -2763,9 +2764,10 @@ export default function App() {
       <footer className="no-print bg-white border-t border-slate-200 py-8 px-6 mt-12 text-center text-xs text-slate-400">
         <div className="max-w-7xl mx-auto flex flex-col items-center gap-4">
           <img 
-            src="/assets/octoskill-logo.png" 
+            src="/assets/octoskill logo.png" 
             alt="OctoSkill logo" 
-            className="h-8 w-auto max-w-[130px] object-contain mb-1" 
+            className="w-[130px] h-auto object-contain mb-1" 
+            referrerPolicy="no-referrer"
             id="footer-logo-img"
           />
           <div className="space-y-1">
